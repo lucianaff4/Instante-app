@@ -14,7 +14,7 @@
 <body>
 <div class="wrap">
   <header class="top"><div class="brand">instante<span></span></div><div class="tag">Vídeo → foto de movimento</div></header>
-  <section class="hero"><div class="eyebrow">Experimento · versão 0.3</div><h1>Um movimento.<br>Vários instantes.</h1><p>Transforme um vídeo curto em uma única foto que revela diferentes posições do movimento. Seu vídeo é processado no próprio navegador.</p></section>
+  <section class="hero"><div class="eyebrow">Experimento · versão 0.4</div><h1>Um movimento.<br>Vários instantes.</h1><p>Transforme um vídeo curto em uma única foto que revela diferentes posições do movimento. Seu vídeo é processado no próprio navegador.</p></section>
   <main class="workspace">
     <section class="panel">
       <div class="panelhead"><strong>01 / Seu vídeo</strong><span class="step" id="videoMeta">AGUARDANDO ARQUIVO</span></div>
@@ -29,13 +29,13 @@
     <aside class="panel">
       <div class="panelhead"><strong>Ajustes</strong><span class="step">03 / CRIAR</span></div>
       <div class="controls">
-        <div class="control"><label for="frames">Número de posições <span class="value" id="framesValue">8 quadros</span></label><input id="frames" type="range" min="3" max="16" value="8" step="1"><div class="hint">Mais quadros mostram mais etapas do movimento.</div></div>
-        <div class="control"><label for="blend">Estilo da composição</label><select id="blend"><option value="lighten">Clarear — destaca as partes mais claras</option><option value="screen">Tela — efeito luminoso</option><option value="overlay">Sobrepor — transparência suave</option></select><div class="hint">O melhor estilo depende da luz e do fundo do vídeo.</div></div>
+        <div class="control"><label for="frames">Número de posições <span class="value" id="framesValue">6 quadros</span></label><input id="frames" type="range" min="3" max="12" value="6" step="1"><div class="hint">Mais quadros mostram mais etapas do movimento.</div></div>
+        <div class="control"><label for="blend">Estilo da composição</label><select id="blend"><option value="action">Ação — fundo fixo</option><option value="lighten">Clarear — destaca as partes mais claras</option><option value="screen">Tela — efeito luminoso</option><option value="overlay">Sobrepor — transparência suave</option></select><div class="hint">O melhor estilo depende da luz e do fundo do vídeo.</div></div>
         <div class="control"><label for="spread">Intervalo do movimento <span class="value" id="spreadValue">80%</span></label><input id="spread" type="range" min="30" max="100" value="80" step="5"><div class="hint">Define quanto do vídeo será usado para escolher os quadros.</div></div>
         <button class="btn primary" id="generateBtn" disabled>Criar composição ↗</button>
         <button class="btn download" id="downloadBtn">Baixar imagem PNG ↓</button>
         <div class="status" id="status" aria-live="polite">Selecione um vídeo para começar.</div>
-        <div class="bottomnote">Este é um protótipo inicial. Ele combina quadros inteiros do vídeo; ainda não separa automaticamente a pessoa do fundo. Para melhores resultados, use uma câmera estável e um movimento com bom contraste.</div>
+        <div class="bottomnote">O modo Ação tenta manter um único fundo e incluir apenas as áreas que mudam entre os quadros. Funciona melhor com câmera parada; água, sombras e fundos em movimento ainda podem gerar artefatos.</div>
       </div>
     </aside>
   </main>
@@ -102,25 +102,60 @@ async function generate(){
     const cw=Math.max(1,Math.round(w*scale)),ch=Math.max(1,Math.round(h*scale));
     resultCanvas.width=cw;resultCanvas.height=ch;
     const off=document.createElement('canvas');off.width=cw;off.height=ch;
-    const octx=off.getContext('2d');
+    const octx=off.getContext('2d',{willReadFrequently:true});
     if(!octx||!resultCtx)throw new Error('Este navegador não conseguiu criar a área de imagem. Tente abrir no Safari.');
     const count=Number(frames.value),portion=Number(spread.value)/100;
     const start=Math.max(0,video.duration*(1-portion)/2);
     const end=Math.max(start,Math.min(Math.max(0,video.duration-0.06),video.duration-start));
     const times=[];for(let i=0;i<count;i++)times.push(count===1?(start+end)/2:start+(end-start)*(i/(count-1)));
-    const mode=blend.value;resultCtx.clearRect(0,0,cw,ch);resultCtx.globalAlpha=1;
-    resultCtx.globalCompositeOperation=mode==='lighten'?'lighten':mode==='screen'?'screen':'source-over';
+    const mode=blend.value;
     video.pause();
-    for(let i=0;i<times.length;i++){
-      setStatus(`Extraindo quadro ${i+1} de ${times.length}…`);
-      await seekTo(times[i]);
-      try{octx.drawImage(video,0,0,cw,ch)}catch(e){throw new Error('Não consegui ler os quadros desse vídeo. Tente exportá-lo como MP4 H.264.')}
-      if(mode==='overlay'){resultCtx.globalAlpha=i===0?1:0.38;resultCtx.drawImage(off,0,0)}else{resultCtx.globalAlpha=1;resultCtx.drawImage(off,0,0)}
+
+    // Draw a clean base frame first. The "action" mode then adds only pixels
+    // that differ substantially from this reference, rather than stacking
+    // every complete video frame on top of the previous one.
+    const baseIndex=Math.floor(times.length/2);
+    setStatus('Lendo o quadro de fundo…');
+    await seekTo(times[baseIndex]);
+    octx.drawImage(video,0,0,cw,ch);
+    const baseData=octx.getImageData(0,0,cw,ch);
+    const output=resultCtx.createImageData(cw,ch);
+    output.data.set(baseData.data);
+
+    if(mode==='action'){
+      const threshold=42; // RGB difference needed to treat a pixel as moving subject
+      for(let i=0;i<times.length;i++){
+        if(i===baseIndex)continue;
+        setStatus(`Separando movimento ${i+1} de ${times.length}…`);
+        await seekTo(times[i]);
+        octx.clearRect(0,0,cw,ch);octx.drawImage(video,0,0,cw,ch);
+        const src=octx.getImageData(0,0,cw,ch).data;
+        for(let p=0;p<src.length;p+=4){
+          const dr=Math.abs(src[p]-baseData.data[p]);
+          const dg=Math.abs(src[p+1]-baseData.data[p+1]);
+          const db=Math.abs(src[p+2]-baseData.data[p+2]);
+          if((dr+dg+db)>threshold*3){
+            output.data[p]=src[p];output.data[p+1]=src[p+1];output.data[p+2]=src[p+2];output.data[p+3]=255;
+          }
+        }
+      }
+      resultCtx.putImageData(output,0,0);
+    }else{
+      resultCtx.putImageData(baseData,0,0);
+      for(let i=0;i<times.length;i++){
+        if(i===baseIndex)continue;
+        setStatus(`Combinando quadro ${i+1} de ${times.length}…`);
+        await seekTo(times[i]);
+        octx.clearRect(0,0,cw,ch);octx.drawImage(video,0,0,cw,ch);
+        if(mode==='overlay'){resultCtx.globalAlpha=0.38;resultCtx.globalCompositeOperation='source-over'}
+        else{resultCtx.globalAlpha=1;resultCtx.globalCompositeOperation=mode==='lighten'?'lighten':'screen'}
+        resultCtx.drawImage(off,0,0);
+      }
     }
     resultCtx.globalAlpha=1;resultCtx.globalCompositeOperation='source-over';
-    // Verify that the canvas can be exported before showing success.
     try{resultCanvas.toDataURL('image/png')}catch(e){throw new Error('A composição foi criada, mas o navegador bloqueou a exportação. Abra o arquivo no Safari e tente novamente.')}
-    resultWrap.style.display='block';resultPlaceholder.style.display='none';downloadBtn.style.display='block';setStatus('Composição pronta. Toque em Baixar imagem PNG.');
+    resultWrap.style.display='block';resultPlaceholder.style.display='none';downloadBtn.style.display='block';
+    setStatus(mode==='action'?'Composição pronta com fundo fixo. Confira o resultado e baixe o PNG.':'Composição pronta. Toque em Baixar imagem PNG.');
   }catch(err){resultCtx.globalAlpha=1;resultCtx.globalCompositeOperation='source-over';setStatus(err.message||'Algo deu errado. Tente outro vídeo MP4.');}
   finally{generateBtn.disabled=!(video.videoWidth&&video.videoHeight&&video.readyState>=2)}
 }
